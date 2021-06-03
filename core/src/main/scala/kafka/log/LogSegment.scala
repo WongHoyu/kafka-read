@@ -48,7 +48,9 @@ import scala.math._
  * @param txnIndex The transaction index
  * @param baseOffset A lower bound on the offsets in this segment
  * @param indexIntervalBytes The approximate number of bytes between entries in the index
+ *                           log.index.interval.bytes,控制了日志段对象新增索引项的频率。默认情况下日志段写入4KB的消息才会新增一条索引项目
  * @param rollJitterMs The maximum random jitter subtracted from the scheduled segment roll time
+ *                     是一个抖动值，如果没有这个干扰值，未来某个时刻可能同时创建多个日志段对象，将会大大的增加IO压力。
  * @param time The time instance
  */
 @nonthreadsafe
@@ -148,20 +150,28 @@ class LogSegment private[log] (val log: FileRecords,
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
       val physicalPosition = log.sizeInBytes()
+      //如果是空， Kafka 需要记录要写入消息集合的最大时间戳，并将其作为后面新增日志段倒计时的依据。
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
 
+      //判断是不是合法。标准就是看它与日志段起始位移的差值是否在整数范围内，即 largestOffset - baseOffset 的值是不是介于 [0，Int.MAXVALUE] 之间。
+      // (checks that the argument offset can be represented as an integer offset relative to the baseOffset.)
       ensureOffsetInRange(largestOffset)
 
       // append the messages
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
+      //更新日志段最大时间戳和最大时间戳所属消息的位移值。每个日志段都要保存当前最大时间戳信息和所属消息的位移信息。
+      //Broker 端提供定期删除日志的功能,比如只想保留最近 7 天的日志，当前最大时间戳这个值就是判断的依据；而最大时间戳对应的消息的位移值则用于时间戳索引项。
+      // 时间戳索引项保存时间戳与消息位移的对应关系。在这步操作中，Kafka 会更新并保存这组对应关系。
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampSoFar = largestTimestamp
         offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
       }
       // append an entry to the index (if needed)
+      //大概意思是自上次.index文件中添加项以来的字节数，大于索引文件中各条目之间大约的字节数，此次append就会往.index文件中增加一条
+      //log.index.interval.bytes,控制了日志段对象新增索引项的频率。默认情况下日志段写入4KB的消息才会新增一条索引项目
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
         offsetIndex.append(largestOffset, physicalPosition)
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
@@ -294,6 +304,8 @@ class LogSegment private[log] (val log: FileRecords,
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    //调用 translateOffset 方法定位要读取的起始文件位(startPosition)。
+    // 输入参数 startOffset 仅仅是位移值，Kafka 需要根据索引信息找到对应的物理文件位置才能开始读取消息。
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null
@@ -312,8 +324,12 @@ class LogSegment private[log] (val log: FileRecords,
       return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY)
 
     // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+    //待确定了读取起始位置，日志段代码需要根据这部分信息以及 maxSize 和 maxPosition 参数共同计算要读取的总字节数。
+    //如：maxSize=100，maxPosition=300，startPosition=250，那么 read 方法只能读取 50 字节，因为 maxPosition - startPosition = 50。
+    // 我们把它和 maxSize 参数相比较，其中的最小值就是最终能够读取的总字节数。
     val fetchSize: Int = min((maxPosition - startPosition).toInt, adjustedMaxSize)
 
+    //从指定位置读取指定大小的消息
     FetchDataInfo(offsetMetadata, log.slice(startPosition, fetchSize),
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
